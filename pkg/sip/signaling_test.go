@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1169,6 +1170,46 @@ func TestRouteSet(t *testing.T) {
 			require.NoError(t, err)
 		})
 
+		// With add_record_route, the 200 OK prepends this UAS to Record-Route.
+		// In-dialog requests must still use the INVITE route set only — never
+		// route through ourselves (livekit/sip#642).
+		t.Run("BYE with AddRecordRoute", func(t *testing.T) {
+			st := NewServiceTest(t, nil)
+			st.Server.conf.AddRecordRoute = true
+			rrHeaders, expectUAS, _ := makeRouteSetHeaders(t, st)
+			call, ic := st.CreateInboundCall(t, withTestHeaders(rrHeaders...))
+
+			selfRoute := (&sip.RouteHeader{Address: ic.cc.contact.Address}).Value()
+			byeSink := st.TestUA.RegisterSink(call.localTag, "BYE")
+			defer st.TestUA.UnregisterSink(call.localTag, "BYE")
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+
+			closed := make(chan error, 1)
+			go func() {
+				defer close(closed)
+				closed <- ic.Close()
+			}()
+
+			select {
+			case msg := <-byeSink:
+				require.NotNil(t, msg)
+				require.Equal(t, sip.BYE, msg.req.Method)
+				assertRouteHeaders(t, msg.req, expectUAS)
+				for _, h := range msg.req.GetHeaders("Route") {
+					require.NotEqual(t, selfRoute, h.Value(), "BYE must not Route through this UAS")
+					require.NotContains(t, h.Value(), st.Server.sconf.SignalingIP.String()+":"+strconv.Itoa(st.Server.conf.SIPPort),
+						"BYE Route must not contain local signaling address")
+				}
+				_ = msg.tx.Respond(sip.NewResponseFromRequest(msg.req, 200, "OK", nil))
+			case <-ctx.Done():
+				require.Fail(t, "timeout waiting for BYE")
+			}
+			err := <-closed
+			require.NoError(t, err)
+		})
+
 		t.Run("REFER", func(t *testing.T) {
 			st := NewServiceTest(t, nil)
 			rrHeaders, expectUAS, _ := makeRouteSetHeaders(t, st)
@@ -1195,6 +1236,52 @@ func TestRouteSet(t *testing.T) {
 				require.NotNil(t, msg)
 				require.Equal(t, sip.REFER, msg.req.Method)
 				assertRouteHeaders(t, msg.req, expectUAS)
+				_ = msg.tx.Respond(sip.NewResponseFromRequest(msg.req, 202, "Accepted", nil))
+			case err := <-transferRes:
+				require.Fail(t, "unexpected transfer result", err)
+			case <-ctx.Done():
+				require.Fail(t, "timeout waiting for REFER")
+			}
+
+			req := call.NewRequest(sip.BYE)
+			resp := st.TestUA.TransactionRequest(t, req, false)
+			require.Equal(t, sip.StatusCode(200), resp.StatusCode, "Expecting 200 OK")
+
+			err := <-transferRes
+			require.NoError(t, err)
+		})
+
+		t.Run("REFER with AddRecordRoute", func(t *testing.T) {
+			st := NewServiceTest(t, nil)
+			st.Server.conf.AddRecordRoute = true
+			rrHeaders, expectUAS, _ := makeRouteSetHeaders(t, st)
+			call, ic := st.CreateInboundCall(t, withTestHeaders(rrHeaders...))
+			t.Cleanup(func() { ic.Close() })
+
+			referSink := st.TestUA.RegisterSink(call.localTag, "REFER")
+			defer st.TestUA.UnregisterSink(call.localTag, "REFER")
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+
+			transferRes := make(chan error, 1)
+			go func() {
+				defer close(transferRes)
+				err := ic.transferCall(ctx, "tel:+15551234567", nil, false)
+				if err != nil {
+					transferRes <- err
+				}
+			}()
+
+			select {
+			case msg := <-referSink:
+				require.NotNil(t, msg)
+				require.Equal(t, sip.REFER, msg.req.Method)
+				assertRouteHeaders(t, msg.req, expectUAS)
+				for _, h := range msg.req.GetHeaders("Route") {
+					require.NotContains(t, h.Value(), st.Server.sconf.SignalingIP.String()+":"+strconv.Itoa(st.Server.conf.SIPPort),
+						"REFER Route must not contain local signaling address")
+				}
 				_ = msg.tx.Respond(sip.NewResponseFromRequest(msg.req, 202, "Accepted", nil))
 			case err := <-transferRes:
 				require.Fail(t, "unexpected transfer result", err)
