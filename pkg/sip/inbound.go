@@ -2076,9 +2076,30 @@ func (c *sipInbound) swapSrcDst(req *sip.Request) {
 	} else {
 		req.Recipient = c.from.Address
 	}
-	if route := c.invite.RecordRoute(); route != nil {
-		dest = ConvertURI(&route.Address).GetDest()
+
+	// NewByeRequest / NewReferRequest may copy Record-Route from the 200 OK.
+	// When add_record_route is enabled that list includes this UAS, which would
+	// loop in-dialog requests (BYE/REFER) back to ourselves (livekit/sip#642).
+	// Clear those headers and rebuild the UAS route set from the INVITE instead
+	// (RFC 3261 §12.1.1: Record-Route of the request, in order).
+	for req.RemoveHeader("Route") {
 	}
+	for req.RemoveHeader("Record-Route") {
+	}
+	rrHdrs := c.invite.GetHeaders("Record-Route")
+	for _, hdr := range rrHdrs {
+		rr, ok := hdr.(*sip.RecordRouteHeader)
+		if !ok {
+			continue
+		}
+		req.AppendHeader(&sip.RouteHeader{Address: rr.Address})
+	}
+	if len(rrHdrs) > 0 {
+		if route, ok := rrHdrs[0].(*sip.RecordRouteHeader); ok {
+			dest = ConvertURI(&route.Address).GetDest()
+		}
+	}
+
 	req.SetSource(c.inviteOk.Source())
 	req.SetDestination(dest)
 	req.RemoveHeader("From")
@@ -2089,14 +2110,6 @@ func (c *sipInbound) swapSrcDst(req *sip.Request) {
 	for req.RemoveHeader("Via") {
 	}
 	req.PrependHeader(c.generateViaHeader(req))
-
-	rrHdrs := req.GetHeaders("Record-Route")
-	for _, hdr := range rrHdrs {
-		req.PrependHeader(&sip.RouteHeader{Address: hdr.(*sip.RecordRouteHeader).Address})
-	}
-	// Remove all Record-Route headers
-	for req.RemoveHeader("Record-Route") {
-	}
 }
 
 func (c *sipInbound) generateViaHeader(req *sip.Request) *sip.ViaHeader {
