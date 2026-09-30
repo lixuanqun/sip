@@ -32,8 +32,7 @@ import (
 	"time"
 
 	"github.com/livekit/sipgo/transport"
-
-	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -50,8 +49,20 @@ import (
 type PendingTransfer struct {
 	CallID     string
 	TransferTo string
-	Error      atomic.Pointer[error]
-	Done       chan error
+
+	// TODO: record the transfer id here as soon as the transfer starts. It is
+	// only known inside the worker goroutine today, so a waiter that gives up
+	// before the outcome arrives reports a failure with no transfer id, and the
+	// caller cannot match it against the transfer in their logs.
+	Outcome atomic.Pointer[transferOutcome]
+	Done    chan transferOutcome
+}
+
+// transferOutcome is what a finished transfer reports back: the id it was
+// recorded under, and how it ended.
+type transferOutcome struct {
+	TransferID string
+	Err        error
 }
 
 type ServiceConfig struct {
@@ -80,7 +91,7 @@ type Service struct {
 // is the SIPCallInfo that NewCallState will own immediately after.
 type GetStateHandler func(projectID string, obs *rpc.SIPCallObservability, initial *livekit.SIPCallInfo) StateHandler
 
-func NewService(region string, conf *config.Config, mon *stats.Monitor, log logger.Logger, getStateHandler GetStateHandler) (*Service, error) {
+func NewService(region string, conf *config.Config, mon *stats.Monitor, log logger.Logger, getStateHandler GetStateHandler, opts ...ServerOption) (*Service, error) {
 	if log == nil {
 		log = logger.GetLogger()
 	}
@@ -94,12 +105,13 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 		conf.MediaTimeoutInitial = defaultMediaTimeoutInitial
 	}
 	cli := NewClient(region, conf, log, mon, getStateHandler)
+	options := append([]ServerOption{WithClient(cli)}, opts...)
 	s := &Service{
 		conf:             conf,
 		log:              log,
 		mon:              mon,
 		cli:              cli,
-		srv:              NewServer(region, conf, log, mon, getStateHandler, WithClient(cli)),
+		srv:              NewServer(region, conf, log, mon, getStateHandler, options...),
 		pendingTransfers: make(map[LocalTag]*PendingTransfer),
 	}
 	var err error
@@ -244,13 +256,16 @@ func (s *Service) Start() error {
 		if len(tconf.Certs) == 0 {
 			return errors.New("TLS certificate required")
 		}
-		var certs []tls.Certificate
-		for _, c := range tconf.Certs {
-			cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
+		certs, err := loadTLSCertificates(tconf.Certs)
+		if err != nil {
+			return err
+		}
+		clientCerts := certs
+		if len(tconf.ClientCerts) > 0 {
+			clientCerts, err = loadTLSCertificates(tconf.ClientCerts)
 			if err != nil {
 				return err
 			}
-			certs = append(certs, cert)
 		}
 		var keyLog io.Writer
 		if tconf.KeyLog != "" {
@@ -269,9 +284,10 @@ func (s *Service) Start() error {
 			}()
 		}
 		tlsConf = &tls.Config{
-			NextProtos:   tlsALPNProtocols(tconf.ALPNProtocols),
-			Certificates: certs,
-			KeyLogWriter: keyLog,
+			NextProtos:           tlsALPNProtocols(tconf.ALPNProtocols),
+			Certificates:         certs,
+			GetClientCertificate: clientCertificateFunc(clientCerts),
+			KeyLogWriter:         keyLog,
 		}
 
 		if len(tconf.CipherSuites) > 0 {
@@ -334,23 +350,65 @@ func (s *Service) CreateSIPParticipantAffinity(ctx context.Context, req *rpc.Int
 	return 1 / (1 + active)
 }
 
-func (s *Service) TransferSIPParticipant(ctx context.Context, req *rpc.InternalTransferSIPParticipantRequest) (*emptypb.Empty, error) {
-	resp, err := s.transferSIPParticipant(ctx, req)
-	return resp, siperrors.ApplySIPStatus(err)
+func (s *Service) TransferSIPParticipant(ctx context.Context, req *rpc.InternalTransferSIPParticipantRequest) (*rpc.InternalTransferSIPParticipantResponse, error) {
+	out := s.transferSIPParticipant(ctx, req)
+	if errors.Is(out.Err, errTransferCallEnded) {
+		// Temporary: the call ended before the transfer completed, so the
+		// transfer did not succeed. This should be a failure, but for backward
+		// compatibility reasons, keeping this as a success for the time being,
+		// i.e. no error, but more details in the response.
+		s.log.Infow("transfer: call ended before it completed, reporting it in the response",
+			"callID", req.SipCallId, "transferTo", req.TransferTo, "transferID", out.TransferID)
+		return transferResponse(out), nil
+	}
+	if out.Err != nil {
+		return nil, transferError(out)
+	}
+	return transferResponse(out), nil
 }
 
-func (s *Service) transferSIPParticipant(ctx context.Context, req *rpc.InternalTransferSIPParticipantRequest) (*emptypb.Empty, error) {
+// transferError reports the outcome of a failed transfer on the error.
+func transferError(out transferOutcome) error {
+	if out.Err == nil {
+		return nil
+	}
+	reason, sipStatus := transferReason(out.Err)
+	// Borrow the code only. ApplySIPStatus derives it from the SIP status when
+	// the failure carries one, and is a pass-through otherwise, leaving the code
+	// the error already had.
+	code, ok := psrpc.GetErrorCode(siperrors.ApplySIPStatus(out.Err))
+	if !ok {
+		code = psrpc.Unknown
+	}
+	details := []proto.Message{&livekit.SIPTransferError{
+		TransferId: out.TransferID,
+		Reason:     reason,
+		SipStatus:  sipStatus,
+	}}
+	if sipStatus != nil {
+		// Deliberately the same status twice. A client whose protocol predates
+		// SIPTransferError cannot resolve that detail, and the Go SDK swaps the
+		// twirp error for a status error before the caller sees it, so its
+		// metadata is out of reach too. This copy keeps SIPStatusFrom working
+		// for those clients. Remove once they have all moved on.
+		details = append(details, sipStatus)
+	}
+	return psrpc.NewError(code, out.Err, details...)
+}
+
+func (s *Service) transferSIPParticipant(ctx context.Context, req *rpc.InternalTransferSIPParticipantRequest) transferOutcome {
 	s.log.Infow("transferring SIP call", "callID", req.SipCallId, "transferTo", req.TransferTo)
 
 	// Check if provider is internal and config is set before allowing transfer
 	if err := s.checkInternalProviderRequest(ctx, req.SipCallId); err != nil {
-		return &emptypb.Empty{}, err
+		return transferOutcome{Err: err}
 	}
 
 	pending, isNew := s.getOrCreatePendingTransfer(req.SipCallId, req.TransferTo)
 	if !isNew {
 		if pending.TransferTo != req.TransferTo {
-			return &emptypb.Empty{}, psrpc.NewErrorf(psrpc.InvalidArgument, "call already being transferred elsewhere")
+			err := psrpc.NewErrorf(psrpc.InvalidArgument, "call already being transferred elsewhere")
+			return transferOutcome{Err: err}
 		}
 		// Already transferred, resume wait
 		s.log.Debugw("repeated request for call transfer", "callID", req.SipCallId, "transferTo", req.TransferTo)
@@ -369,13 +427,13 @@ func (s *Service) transferSIPParticipant(ctx context.Context, req *rpc.InternalT
 			defer cdone()
 
 			headers := maps.Clone(req.Headers) // shallow clone - string/string map. Needed to avoid mutating psrpc req
-			err := s.processParticipantTransfer(ctx, req.SipCallId, req.TransferTo, headers, req.PlayDialtone)
+			out := s.processParticipantTransfer(ctx, req.SipCallId, req.TransferTo, headers, req.PlayDialtone)
 			select {
-			case pending.Done <- err:
+			case pending.Done <- out:
 			default:
-				s.log.Errorw("pending transfer received more than one error", err, "callID", req.SipCallId, "transferTo", req.TransferTo)
+				s.log.Errorw("pending transfer received more than one error", out.Err, "callID", req.SipCallId, "transferTo", req.TransferTo)
 			}
-			pending.Error.Store(&err)
+			pending.Outcome.Store(&out)
 			close(pending.Done)
 
 			s.mu.Lock()
@@ -385,19 +443,56 @@ func (s *Service) transferSIPParticipant(ctx context.Context, req *rpc.InternalT
 	}
 
 	select {
-	case err := <-pending.Done:
-		if err == nil {
+	case out := <-pending.Done:
+		if out.Err == nil {
 			// If there is more than one RPC call waiting on the result,
-			// this ensures we return the same error to all callers.
-			if pErr := pending.Error.Load(); pErr != nil {
-				err = *pErr
+			// this ensures we return the same outcome to all callers.
+			if pOut := pending.Outcome.Load(); pOut != nil {
+				out = *pOut
 			}
 		}
-		return &emptypb.Empty{}, err
+		return out
 	case <-ctx.Done():
-		return &emptypb.Empty{}, psrpc.NewError(psrpc.Canceled, ctx.Err())
+		return transferOutcome{Err: psrpc.NewError(psrpc.Canceled, ctx.Err())}
 	}
 }
+
+// transferReason classifies how a transfer ended. A rejected transfer also
+// reports the SIP status the transferee, or its provider, answered with.
+func transferReason(err error) (livekit.SIPTransferReason, *livekit.SIPStatus) {
+	if err == nil {
+		return livekit.SIPTransferReason_STR_COMPLETED, nil
+	}
+	var sipStatus *livekit.SIPStatus
+	switch {
+	case errors.Is(err, errTransferCallEnded):
+		return livekit.SIPTransferReason_STR_CALL_ENDED, nil
+	case errors.Is(err, errReferSubscriptionTerminated):
+		return livekit.SIPTransferReason_STR_SUBSCRIPTION_TERMINATED, nil
+	case errors.As(err, &sipStatus):
+		return livekit.SIPTransferReason_STR_REJECTED, sipStatus
+	case errors.Is(err, context.DeadlineExceeded):
+		return livekit.SIPTransferReason_STR_RINGING_TIMEOUT, nil
+	}
+	return livekit.SIPTransferReason_STR_UNSPECIFIED, nil
+}
+
+// transferResponse reports the outcome of a transfer in the response. Only
+// STR_CALL_ENDED still needs it, and it goes away once that becomes an error.
+func transferResponse(out transferOutcome) *rpc.InternalTransferSIPParticipantResponse {
+	reason, sipStatus := transferReason(out.Err)
+	status := livekit.SIPTransferStatus_STS_TRANSFER_SUCCESSFUL
+	if out.Err != nil {
+		status = livekit.SIPTransferStatus_STS_TRANSFER_FAILED
+	}
+	return &rpc.InternalTransferSIPParticipantResponse{
+		TransferId: out.TransferID,
+		Status:     status,
+		Reason:     reason,
+		SipStatus:  sipStatus,
+	}
+}
+
 func (s *Service) getOrCreatePendingTransfer(callID string, transferTo string) (*PendingTransfer, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -411,13 +506,13 @@ func (s *Service) getOrCreatePendingTransfer(callID string, transferTo string) (
 	pending = &PendingTransfer{
 		CallID:     callID,
 		TransferTo: transferTo,
-		Done:       make(chan error, 1),
+		Done:       make(chan transferOutcome, 1),
 	}
 	s.pendingTransfers[keyCall] = pending
 	return pending, true
 }
 
-func (s *Service) processParticipantTransfer(ctx context.Context, callID string, transferTo string, headers map[string]string, dialtone bool) error {
+func (s *Service) processParticipantTransfer(ctx context.Context, callID string, transferTo string, headers map[string]string, dialtone bool) transferOutcome {
 	// Look for call both in client (outbound) and server (inbound)
 	s.cli.cmu.Lock()
 	out := s.cli.activeCalls[LocalTag(callID)]
@@ -425,13 +520,13 @@ func (s *Service) processParticipantTransfer(ctx context.Context, callID string,
 
 	if out != nil {
 		s.mon.TransferStarted(stats.Outbound)
-		err := out.transferCall(ctx, transferTo, headers, dialtone)
+		transferID, err := out.transferCall(ctx, transferTo, headers, dialtone)
 		if err != nil {
 			s.mon.TransferFailed(stats.Outbound, extractTransferErrorReason(err), true)
-			return err
+			return transferOutcome{TransferID: transferID, Err: err}
 		}
 		s.mon.TransferSucceeded(stats.Outbound)
-		return nil
+		return transferOutcome{TransferID: transferID}
 	}
 
 	s.srv.cmu.Lock()
@@ -440,18 +535,18 @@ func (s *Service) processParticipantTransfer(ctx context.Context, callID string,
 
 	if in != nil {
 		s.mon.TransferStarted(stats.Inbound)
-		err := in.transferCall(ctx, transferTo, headers, dialtone)
+		transferID, err := in.transferCall(ctx, transferTo, headers, dialtone)
 		if err != nil {
 			s.mon.TransferFailed(stats.Inbound, extractTransferErrorReason(err), true)
-			return err
+			return transferOutcome{TransferID: transferID, Err: err}
 		}
 		s.mon.TransferSucceeded(stats.Inbound)
-		return nil
+		return transferOutcome{TransferID: transferID}
 	}
 
 	err := psrpc.NewErrorf(psrpc.NotFound, "unknown call")
 	s.mon.TransferFailed(stats.Inbound, "unknown_call", false)
-	return err
+	return transferOutcome{Err: err}
 }
 
 func (s *Service) checkInternalProviderRequest(ctx context.Context, callID string) error {
@@ -501,6 +596,15 @@ func extractTransferErrorReason(err error) string {
 		// Use ShortName() to get the status code name without "SIP_STATUS_" prefix
 		// and convert to lowercase for metric labels
 		return strings.ToLower(sipStatus.Code.ShortName())
+	}
+
+	// Transfer outcomes the bridge decides itself. They carry no SIP status, so
+	// the switch below would report them all as psrpc_error.
+	if errors.Is(err, errTransferCallEnded) {
+		return "call_ended"
+	}
+	if errors.Is(err, errReferSubscriptionTerminated) {
+		return "refer_terminated"
 	}
 
 	// Check for psrpc errors
