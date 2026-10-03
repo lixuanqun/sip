@@ -114,6 +114,7 @@ func (lk *LiveKit) CreateSIPParticipantSync(t TB, req *livekit.CreateSIPParticip
 }
 
 func (lk *LiveKit) Connect(t TB, room, identity string, cb *lksdk.RoomCallback) *lksdk.Room {
+	lksdk.SetLogger(logger.NewTestLogger(t))
 	r := lksdk.NewRoom(cb)
 	// faster connection timeout since they should be in the same DC
 	err := r.Join(lk.WsUrl, lksdk.ConnectInfo{
@@ -201,7 +202,7 @@ func (lk *LiveKit) ConnectParticipant(t TB, room, identity string, cb *RoomParti
 		inp := p.mixIn.NewInput()
 		defer inp.Close()
 
-		codec, err := opus.Decode(inp, channels, logger.GetLogger())
+		codec, err := opus.Decode(inp, channels, logger.NewTestLogger(t))
 		if err != nil {
 			return
 		}
@@ -294,7 +295,7 @@ func (p *Participant) newAudioTrack() (msdk.Writer[msdk.PCM16Sample], error) {
 		return nil, err
 	}
 	ow := msdk.FromSampleWriter[opus.Sample](track, RoomSampleRate, rtp.DefFrameDur)
-	pw, err := opus.Encode(ow, channels, logger.GetLogger())
+	pw, err := opus.Encode(ow, channels, logger.NewTestLogger(p.t))
 	if err != nil {
 		return nil, err
 	}
