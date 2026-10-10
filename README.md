@@ -55,6 +55,12 @@ redis:
   username: redis username
   password: redis password
   db: redis db
+  # TLS for Redis (managed Redis that rejects plaintext). Same keys as livekit-server:
+  # use_tls: true   # deprecated alias
+  # tls:
+  #   enabled: true
+  #   insecure: false
+  #   server_name: redis.example.com
 
 # optional fields
 health_port: if used, will open an http port for health checks
@@ -62,9 +68,40 @@ prometheus_port: port used to collect prometheus metrics. Used for autoscaling
 log_level: debug, info, warn, or error (default info)
 sip_port: port to listen and send SIP traffic (default 5060)
 rtp_port: port to listen and send RTP traffic (default 10000-20000)
+psrpc: # optional gzip compression of psrpc bus payloads, see the compatibility note below
+  compression:
+    quality: gzip level 1-9. 0, the default, disables compression
+    threshold: payload bytes below which compression is skipped (default 1024)
+    max_decompressed_size: cap on an inbound payload after decompression, 0 for unlimited
+# SIP over TLS (inbound listen + outbound dial share this config).
+# tls.certs are used as the server identity and, by default, as the client
+# certificate when a trunk requires mTLS on outbound TLS dials (#530).
+# tls:
+#   port: 5061
+#   port_listen: 5061
+#   certs:
+#     - cert_file: /path/to/fullchain.pem
+#       key_file: /path/to/privkey.pem
+#   # optional separate client identity for outbound mTLS:
+#   # client_certs:
+#   #   - cert_file: /path/to/client.pem
+#   #     key_file: /path/to/client-key.pem
 ```
 
 The config file can be added to a mounted volume with its location passed in the SIP_CONFIG_FILE env var, or its body can be passed in the SIP_CONFIG_BODY env var.
+
+> **Compatibility note on `psrpc.compression`**
+>
+> Bus compression requires psrpc v0.7.6 or newer on **every** node sharing the redis bus. An older peer
+> ignores the compression marker and decodes the gzipped bytes as the message payload, so the message is
+> dropped without an error. Enabling it is therefore a two-stage operator action: roll a build with psrpc
+> v0.7.6+ out to LiveKit server, egress, ingress, SIP and any agent workers first, then raise `quality` at
+> the publishers. It is off by default.
+>
+> `max_decompressed_size` only affects reading, so it can be set ahead of `quality`.
+>
+> The remaining `psrpc` keys (`max_attempts`, `timeout`, `backoff`, `buffer_size`) are accepted for config
+> parity with LiveKit server, but SIP does not read them.
 
 ### Using the SIP service
 
